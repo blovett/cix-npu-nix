@@ -1,0 +1,200 @@
+Subject: [PATCH] armchina-npu: build and probe against Linux 6.11 / 7.x
+
+Compat fixes to build and load the CIX SKY1 (Zhouyi V3) NPU driver against
+a mainline kernel newer than the 6.6 BSP it targets. Verified building,
+probing and unloading cleanly on Linux 7.2.0 (aarch64, Radxa Orion O6,
+ACPI boot).
+
+ * aipu_mm.c:
+   - MAX_ORDER was renamed to MAX_PAGE_ORDER in v6.10 (5e0a760b4441); add a
+     fallback #define. Meaning (inclusive max allocatable order) is
+     unchanged since v6.4, so the mask expression is otherwise untouched.
+   - aipu_mm_reserved_iova_for_never_map() reached into the private
+     struct iommu_dma_cookie via an in-tree copy of its (6.6-era) layout.
+     That struct changed (type/union discriminator removed, iovad moved to
+     offset 0), so &cookie->iovad pointed at garbage and reserve_iova()
+     oopsed. Since ~v6.7 the opaque iova_cookie pointer is the
+     iova_domain; cast it directly. Keep the old path for < 6.7.
+
+ * aipu_dma_buf.c: MODULE_IMPORT_NS() takes a string literal since v6.13.
+
+ * aipu_irq.c: request_irq() with IRQF_ONESHOT but no thread_fn triggers
+   WARN_ON_ONCE() in __setup_irq() on v6.x. The bottom half is a
+   workqueue, not a threaded IRQ, and the primary handler acks the NPU in
+   hardware, so just drop IRQF_ONESHOT.
+
+ * sky1/sky1.c:
+   - pm_runtime_put() returns void since v6.10; the two call sites that
+     check the result switch to pm_runtime_put_sync().
+   - platform_driver::remove takes a void-returning callback since v6.11
+     (0edb555a65d1).
+   - The devfreq path calls CIX-BSP-only SCMI helpers
+     (scmi_device_get_freq/set_freq/opp_table_parse) absent upstream.
+     Gate the whole devfreq block on CONFIG_ENABLE_DEVFREQ (call sites
+     already were) so BUILD_NPU_DEVFREQ=n builds cleanly.
+     TODO: port to the mainline SCMI perf-domain / dev_pm_opp API.
+
+--- a/armchina-npu/aipu_mm.c	2026-08-27 03:39:40.032416991 +0000
++++ b/armchina-npu/aipu_mm.c	2026-08-27 03:39:40.066841530 +0000
+@@ -25,6 +25,12 @@
+ #include "aipu_dma_buf.h"
+ #include "v2.h"
+ 
++/* MAX_ORDER was renamed to MAX_PAGE_ORDER in v6.10 (commit 5e0a760b4441).
++ * Its meaning (largest allocatable order, inclusive) is unchanged since v6.4. */
++#ifndef MAX_PAGE_ORDER
++#define MAX_PAGE_ORDER MAX_ORDER
++#endif
++
+ #define EXIT_ENCODE_BUF_SIZE (1024)
+ #define IOVA_FREE  false
+ #define IOVA_ALLOC true
+@@ -887,7 +893,6 @@
+ static int aipu_mm_reserved_iova_for_never_map(struct aipu_memory_manager *mm, bool flag)
+ {
+ 	struct iommu_domain *iommu_domain = NULL;
+-	struct iommu_dma_cookie *cookie = NULL;
+ 	struct iova_domain *iovad = NULL;
+ 	u64 bus_dma_limit;
+ 	unsigned long lo, hi;
+@@ -904,8 +909,19 @@
+ 
+ 		iovad = &mm->iova_domain;
+ 	} else {
+-	cookie = iommu_domain->iova_cookie;
+-	iovad = &cookie->iovad;
++#if (KERNEL_VERSION(6, 7, 0) <= LINUX_VERSION_CODE)
++		/*
++		 * struct iommu_dma_cookie is private to drivers/iommu/dma-iommu.c.
++		 * Since ~v6.7 the type/union discriminator is gone and the struct
++		 * begins with its struct iova_domain, so the opaque iova_cookie
++		 * pointer *is* the iova_domain. Verified against 7.2; the exact
++		 * boundary within 6.7..7.1 is unverified.
++		 */
++		iovad = (struct iova_domain *)iommu_domain->iova_cookie;
++#else
++		/* Older layout: { enum type; union { struct iova_domain iovad; ... }; ... } */
++		iovad = &((struct iommu_dma_cookie *)iommu_domain->iova_cookie)->iovad;
++#endif
+ 	}
+ 
+ #if (KERNEL_VERSION(5, 5, 0) <= LINUX_VERSION_CODE)
+@@ -2737,7 +2753,7 @@
+ 	struct page **pages;
+ 	unsigned int i = 0, nid = dev_to_node(dev);
+ 
+-	order_mask &= (2U << MAX_ORDER) - 1;
++	order_mask &= (2U << MAX_PAGE_ORDER) - 1;
+ 	//pr_info("order_mask 0x%lx\n", order_mask);
+ 	if (!order_mask)
+ 		return NULL;
+--- a/armchina-npu/aipu_dma_buf.c	2026-08-27 03:39:40.030644036 +0000
++++ b/armchina-npu/aipu_dma_buf.c	2026-08-27 03:39:40.073935551 +0000
+@@ -381,5 +381,5 @@
+ }
+ 
+ #if KERNEL_VERSION(5, 4, 0) < LINUX_VERSION_CODE
+-MODULE_IMPORT_NS(DMA_BUF);
++MODULE_IMPORT_NS("DMA_BUF");
+ #endif
+--- a/armchina-npu/aipu_irq.c	2026-08-27 03:39:40.031399653 +0000
++++ b/armchina-npu/aipu_irq.c	2026-08-27 03:39:47.450364371 +0000
+@@ -63,12 +63,14 @@
+ 
+ 	INIT_WORK(&irq_obj->work, aipu_irq_handler_bottom_half);
+ 
+-	/**
+-	 * Flag IRQF_ONESHOT is used when sharing interrupts with other devices using thread_irq.
+-	 * Remove it if you have no such a usage scenario.
++	/*
++	 * The bottom half runs on a workqueue (not a threaded IRQ), and the
++	 * primary handler acks/clears the NPU interrupt in hardware before it
++	 * returns, so there is no threaded handler. IRQF_ONESHOT without a
++	 * thread_fn triggers WARN_ON_ONCE() in __setup_irq() since v6.x.
+ 	 */
+ 	ret = request_irq(irqnum, aipu_irq_handler_upper_half,
+-			  IRQF_ONESHOT | IRQF_SHARED | IRQF_PROBE_SHARED,
++			  IRQF_SHARED | IRQF_PROBE_SHARED,
+ 			  description, irq_obj->dev);
+ 	if (ret) {
+ 		dev_err(dev, "request_irq failed: irqnum %u, ret %d", irqnum, ret);
+--- a/armchina-npu/sky1/sky1.c	2026-08-27 03:39:40.036598177 +0000
++++ b/armchina-npu/sky1/sky1.c	2026-08-27 03:39:40.075964789 +0000
+@@ -41,6 +41,15 @@
+ 	return cix_aipu_priv;
+ }
+ 
++#ifdef CONFIG_ENABLE_DEVFREQ
++/*
++ * The devfreq path drives NPU DVFS through CIX SCMI helpers
++ * (scmi_device_get_freq() / scmi_device_set_freq() /
++ * scmi_device_opp_table_parse()) that only exist in the CIX BSP kernel, not
++ * mainline. Until it is ported to the upstream SCMI perf-domain / dev_pm_opp
++ * API it is compiled out; the NPU then runs at whatever OPP firmware leaves
++ * it at. Build with BUILD_NPU_DEVFREQ=n.
++ */
+ static void remove_debugfs_dir(const char *name)
+ {
+     struct dentry *dentry;
+@@ -244,6 +253,8 @@
+     return 0;
+ }
+ 
++#endif /* CONFIG_ENABLE_DEVFREQ */
++
+ int sky1_npu_pm_runtime_get_sync(struct device *dev)
+ {
+ #ifdef CONFIG_PM
+@@ -264,9 +275,10 @@
+ int sky1_npu_pm_runtime_put(struct device *dev)
+ {
+ #ifdef CONFIG_PM
+-	int ret = 0;
++	/* pm_runtime_put() returns void since v6.10 (it only queues an async
++	 * idle check); use the _sync variant to keep the error report. */
++	int ret = pm_runtime_put_sync(dev);
+ 
+-	ret = pm_runtime_put(dev);
+ 	if (ret < 0)
+ 		dev_err(dev, "PM runtime put failed! ret=%d", ret);
+ 
+@@ -431,7 +443,9 @@
+ 	sky1_npu_devfreq_remove(&p_dev->dev, cix_aipu_priv);
+ #endif
+ 
++#ifdef CONFIG_ENABLE_DEVFREQ
+ devfreq_init_failed:
++#endif
+ 	for (i=0; i < CIX_NPU_PD_NUM; i++) {
+ 		dev_pm_domain_detach(cix_aipu_priv->pd_core[i], true);
+ 	}
+@@ -439,7 +453,9 @@
+ 	return ret;
+ }
+ 
+-static int sky1_npu_remove(struct platform_device *p_dev)
++/* platform_driver::remove takes a void-returning callback since v6.11
++ * (commit 0edb555a65d1). */
++static void sky1_npu_remove(struct platform_device *p_dev)
+ {
+ 	dev_dbg(&p_dev->dev, "%s \n", __func__);
+ #ifdef CONFIG_ENABLE_DEVFREQ
+@@ -453,8 +469,6 @@
+ #ifdef CONFIG_PM
+ 	pm_runtime_disable(&p_dev->dev);
+ #endif /* CONFIG_PM */
+-
+-	return 0;
+ }
+ 
+ #ifdef CONFIG_PM
+@@ -473,7 +487,8 @@
+ 
+ 	if (has_acpi_companion(dev)) {
+ 		for (int i = 0; i < CIX_NPU_PD_NUM; i++) {
+-			ret = pm_runtime_put(cix_aipu_priv->pd_core[i]);
++			/* pm_runtime_put() is void since v6.10 */
++			ret = pm_runtime_put_sync(cix_aipu_priv->pd_core[i]);
+ 			if (ret < 0) {
+ 				dev_err(cix_aipu_priv->pd_core[i], "NPU core PM runtime put failed! ret=%d", ret);
+ 				return ret;

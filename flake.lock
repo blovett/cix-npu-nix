@@ -1,0 +1,63 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1787753485,
+        "narHash": "sha256-BZWCi9ZRJiARTuKTbbtvFTj7t1TK4G3UEckT3HyNfRg=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "062346a6d85bc4b49dfaa61c986e9c5be21217d1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-26.05",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "npu-driver-5_11_0": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1759248517,
+        "narHash": "sha256-e5GIXzA+0x095H54I/T2QAfHVHOWY2dwJhCpdYUJF2k=",
+        "owner": "cixtech",
+        "repo": "cix_opensource__npu_driver",
+        "rev": "a1b161f868f4019c4a1e5c843b0f5c93131e7726",
+        "type": "github"
+      },
+      "original": {
+        "owner": "cixtech",
+        "repo": "cix_opensource__npu_driver",
+        "rev": "a1b161f868f4019c4a1e5c843b0f5c93131e7726",
+        "type": "github"
+      }
+    },
+    "npu-driver-6_0_1": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1782736074,
+        "narHash": "sha256-3CpAHlRn1uQZ35a70i4nYhSPlVrFE8pqVDBFHTdX920=",
+        "owner": "cixtech",
+        "repo": "cix_opensource__npu_driver",
+        "rev": "25b55cc08ec735093b5808c7cd0723f1a128c645",
+        "type": "github"
+      },
+      "original": {
+        "owner": "cixtech",
+        "repo": "cix_opensource__npu_driver",
+        "rev": "25b55cc08ec735093b5808c7cd0723f1a128c645",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "npu-driver-5_11_0": "npu-driver-5_11_0",
+        "npu-driver-6_0_1": "npu-driver-6_0_1"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
